@@ -327,7 +327,7 @@ def _build_gateway_cmd_script(python_path: str, working_dir: str, hermes_home: s
 
 
 def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: str, profile_arg: str) -> str:
-    """Build the hidden-console ``gateway.vbs`` launcher (CRLF-terminated).
+    """Build the hidden-console ``gateway.vbs`` supervisor shim (CRLF-terminated).
 
     Run via ``wscript.exe``, not ``cmd.exe``: at logon Windows broadcasts CTRL_CLOSE_EVENT to console
     groups, killing a cmd-hosted gateway with STATUS_CONTROL_C_EXIT, which Task Scheduler treats as a
@@ -340,6 +340,12 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     single hidden console — never shown, never CTRL_CLOSE'd at logon, and inherited by every
     console-subsystem descendant (git, gh, node, …) so none of them allocate a visible flashing conhost
     (#54220/#56747; the previous console-less pythonw.exe gateway forced exactly that per-descendant flash).
+    Keep the VBS process alive until Python exits and propagate its exit code.  Task Scheduler's
+    ``RestartOnFailure`` supervises the VBS action, not grandchildren: an asynchronous ``Run`` made
+    the task report success immediately and left a later gateway crash invisible to the configured
+    restart policy.  The Startup-folder fallback also uses this shim; waiting there is harmless but
+    still only provides login persistence (there is no scheduler to relaunch it after a crash).
+
     No cmd.exe anywhere in the chain. Mirrors ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
     """
@@ -351,7 +357,7 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, exit_code",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({q('HERMES_HOME')}) = {q(hermes_home)}",
@@ -365,8 +371,10 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"  env.Item({q('PYTHONPATH')}) = {q(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async.
-        f"sh.Run {q(command_line)}, 0, False",
+        # Window style 0 = hidden. Waiting is load-bearing: it lets Task Scheduler observe the
+        # gateway's real exit code and apply RestartOnFailure.
+        f"exit_code = sh.Run({q(command_line)}, 0, True)",
+        "WScript.Quit exit_code",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -525,6 +533,23 @@ def _install_startup_entry(script_path: Path) -> Path:
     except OSError:
         pass
     return entry
+
+
+def _remove_startup_entries() -> None:
+    """Remove obsolete login-only launchers after Scheduled Task takeover.
+
+    Leaving the fallback beside a successful Scheduled Task creates two logon
+    launchers for one profile.  The loser exits on the gateway lock and can be
+    mistaken by Task Scheduler for a failed supervised action, causing a
+    pointless restart loop.  Only Hermes' two exact, profile-scoped launcher
+    paths are touched; failures are best-effort because the Scheduled Task is
+    already the durable owner.
+    """
+    for entry in (get_startup_entry_path(), _legacy_startup_entry_path()):
+        try:
+            entry.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove obsolete gateway Startup entry: %s", entry)
 
 
 def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
@@ -717,6 +742,8 @@ def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -
     entry = _install_startup_entry(script_path)
     print(f"✓ Installed Windows login item: {entry}")
     print(f"  Task script: {script_path}")
+    print("⚠ Startup-folder fallback starts the gateway at login but cannot restart it after a crash.")
+    print("  Re-run `hermes gateway install` with UAC approval for Scheduled Task crash recovery.")
 
     # Re-running install must be safe: the fallback only installs login persistence; starting is
     # controlled by the pre-UAC start_now answer so every user decision precedes elevation.
@@ -787,6 +814,7 @@ def install(
 
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
+        _remove_startup_entries()
         print(f"✓ {detail}")
         print(f"  Task script: {script_path}")
         print("ℹ Gateway auto-start installed for Windows login.")
@@ -1347,6 +1375,7 @@ def status(deep: bool = False) -> None:
     elif startup_installed:
         entry = get_startup_entry_path()
         print(f"✓ Windows login item installed: {entry if entry.exists() else _legacy_startup_entry_path()}")
+        print("⚠ Startup-folder fallback is not a crash supervisor; install the Scheduled Task for auto-restart.")
     else:
         print("✗ Gateway service not installed")
 
