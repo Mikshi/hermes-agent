@@ -314,9 +314,34 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "cmd.exe" not in xml_seen["text"]
 
 
-def test_gateway_vbs_script_is_console_less(monkeypatch):
-    """The .vbs launcher must avoid cmd.exe entirely and Run pythonw hidden
-    (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A)."""
+def test_successful_scheduled_task_install_removes_startup_fallback(monkeypatch, tmp_path):
+    """Exactly one logon owner remains after a fallback is upgraded."""
+    removed = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_prompt_install_choices", lambda *a, **k: (False, True))
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: tmp_path / "gateway.cmd")
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda *a, **k: (True, "Created Scheduled Task 'Hermes_Gateway_alice'"),
+    )
+    monkeypatch.setattr(gateway_windows, "_remove_startup_entries", lambda: removed.append(True))
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+
+    gateway_windows.install(start_now=False, start_on_login=True)
+
+    assert removed == [True]
+
+
+def test_gateway_vbs_script_is_console_less_and_propagates_exit(monkeypatch):
+    """The task action stays hidden but owns Python's lifetime and result.
+
+    Task Scheduler applies ``RestartOnFailure`` to wscript.exe.  If the VBS
+    launcher returns immediately, a later gateway crash is invisible and the
+    configured restart policy is inert.
+    """
     monkeypatch.setattr(
         gateway_windows,
         "_resolve_detached_python",
@@ -333,7 +358,9 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
+    assert ", 0, True)" in content  # hidden window, wait for the gateway
+    assert "WScript.Quit exit_code" in content
+    assert ", 0, False" not in content
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
@@ -362,8 +389,6 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
-
 
 
 
