@@ -50,7 +50,10 @@ _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
-_TASK_RESTART_COUNT = 999
+# Task Scheduler's XML schema declares RestartOnFailure/Count as unsignedByte.
+# Keep the retry budget deliberately bounded and schema-valid; Windows accepts
+# larger values during registration but does not reliably apply the policy.
+_TASK_RESTART_COUNT = 10
 
 _GATEWAY_ENV = (("PYTHONIOENCODING", "utf-8"), ("HERMES_GATEWAY_DETACHED", "1"), ("HERMES_SUPERVISED_CHILD", "1"))
 
@@ -374,6 +377,9 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         # Window style 0 = hidden. Waiting is load-bearing: it lets Task Scheduler observe the
         # gateway's real exit code and apply RestartOnFailure.
         f"exit_code = sh.Run({q(command_line)}, 0, True)",
+        # Forced Windows process termination can surface as signed -1.  Give
+        # Task Scheduler one unambiguous, conventional failure code.
+        "If exit_code <> 0 Then exit_code = 1",
         "WScript.Quit exit_code",
     ]
     return "\r\n".join(lines) + "\r\n"
