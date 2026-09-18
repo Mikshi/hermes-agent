@@ -287,6 +287,14 @@ def _gateway_run_argv(python_exe: str, profile_arg: str) -> list[str]:
     return argv
 
 
+def _gateway_supervisor_argv(python_exe: str, profile_arg: str) -> list[str]:
+    """Profile-aware Python supervisor command owned by the Scheduled Task."""
+    argv = [python_exe, "-m", "hermes_cli.gateway_windows_supervisor"]
+    if profile_arg:
+        argv.extend(profile_arg.split())
+    return argv
+
+
 def _launcher_settings(home: Path | None = None) -> tuple[str, str, str, str]:
     """Return (python_path, working_dir, hermes_home, profile_arg) for generated launchers.
     ``home`` targets another profile's HERMES_HOME (per-profile cold-start, #110959)."""
@@ -343,18 +351,17 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
     single hidden console — never shown, never CTRL_CLOSE'd at logon, and inherited by every
     console-subsystem descendant (git, gh, node, …) so none of them allocate a visible flashing conhost
     (#54220/#56747; the previous console-less pythonw.exe gateway forced exactly that per-descendant flash).
-    Keep the VBS process alive until Python exits and propagate its exit code.  Task Scheduler's
-    ``RestartOnFailure`` supervises the VBS action, not grandchildren: an asynchronous ``Run`` made
-    the task report success immediately and left a later gateway crash invisible to the configured
-    restart policy.  The Startup-folder fallback also uses this shim; waiting there is harmless but
-    still only provides login persistence (there is no scheduler to relaunch it after a crash).
+    Keep the VBS process alive until the Python supervisor exits and propagate its exit code. The
+    supervisor owns bounded application recovery because live Windows evidence showed that
+    ``RestartOnFailure`` did not relaunch a failed action even after wscript returned ``1``.
+    Task Scheduler remains the login-time owner and coarse final backstop.
 
     No cmd.exe anywhere in the chain. Mirrors ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
     """
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     # list2cmdline gives CreateProcess-correct quoting for WScript.Shell.Run.
-    command_line = subprocess.list2cmdline(_gateway_run_argv(python_exe_path, profile_arg))
+    command_line = subprocess.list2cmdline(_gateway_supervisor_argv(python_exe_path, profile_arg))
     static_pythonpath = os.pathsep.join(_launcher_pythonpath_entries(extra_pythonpath))
     q = _quote_vbs_string
     lines = [
@@ -374,12 +381,9 @@ def _build_gateway_vbs_script(python_path: str, working_dir: str, hermes_home: s
         f"  env.Item({q('PYTHONPATH')}) = {q(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {q(working_dir)}",
-        # Window style 0 = hidden. Waiting is load-bearing: it lets Task Scheduler observe the
-        # gateway's real exit code and apply RestartOnFailure.
+        # Window style 0 = hidden. Waiting is load-bearing: the task owns the supervisor lifetime.
         f"exit_code = sh.Run({q(command_line)}, 0, True)",
-        # Forced Windows process termination can surface as signed -1.  Give
-        # Task Scheduler one unambiguous, conventional failure code.
-        "If exit_code <> 0 Then exit_code = 1",
+        # Preserve the supervisor's semantic result. Child 75/78 interpretation happens inside Python.
         "WScript.Quit exit_code",
     ]
     return "\r\n".join(lines) + "\r\n"
@@ -1294,17 +1298,19 @@ def _probe_running_pid() -> int | None:
         return None
 
 
-def _probe_pid_exists(candidate_pid: int | None) -> None:
+def _probe_pid_exists(candidate_pid: int | None) -> bool:
     if candidate_pid is None:
         _probe(4, False, "No candidate PID to verify")
-        return
+        return False
     try:
         from gateway.status import _pid_exists
 
         alive = bool(_pid_exists(candidate_pid))
         _probe(4, alive, f"_pid_exists({candidate_pid}) => {alive}")
+        return alive
     except Exception as exc:
         _probe(4, False, f"_pid_exists raised: {exc!r}")
+        return False
 
 
 def _probe_state_file(state_path: Path) -> None:
@@ -1322,12 +1328,17 @@ def _probe_state_file(state_path: Path) -> None:
                 age_str = f" (updated {age_seconds}s ago)"
             except Exception:
                 pass
-        _probe(5, gateway_state == "running", f"gateway_state.json state={gateway_state!r}{age_str}")
+        from gateway.status import runtime_status_pid_is_live
+
+        live_claim = runtime_status_pid_is_live(state_data)
+        healthy = gateway_state == "running" and live_claim
+        detail = f"gateway_state.json state={gateway_state!r}{age_str} pid_live={live_claim}"
+        _probe(5, healthy, detail)
     except Exception as exc:
         _probe(5, False, f"gateway_state.json present but unreadable: {exc}")
 
 
-def _probe_exit_diag(diag_path: Path) -> None:
+def _probe_exit_diag(diag_path: Path, *, gateway_alive: bool) -> None:
     if _probe_missing(6, diag_path, "exit-diag log"):
         return
     try:
@@ -1343,7 +1354,10 @@ def _probe_exit_diag(diag_path: Path) -> None:
         try:
             event = json.loads(last_event)
             tag = event.get("tag", "?")
-            _probe(6, tag in ("gateway.start",), f"Last lifecycle event: tag={tag} pid={event.get('pid', '?')} ts={event.get('ts', '?')}")
+            historical_unclean = tag == "gateway.previous_unclean_exit" and gateway_alive
+            ok = tag == "gateway.start" or historical_unclean
+            label = "Historical lifecycle event" if historical_unclean else "Last lifecycle event"
+            _probe(6, ok, f"{label}: tag={tag} pid={event.get('pid', '?')} ts={event.get('ts', '?')}")
         except Exception:
             _probe(6, False, f"Last lifecycle line not JSON: {last_event[:120]}")
     except Exception as exc:
@@ -1358,9 +1372,9 @@ def _print_deep_probes() -> None:
     pid_value = _probe_pid_file(home / "gateway.pid")
     _probe_lock_file(home / "gateway.lock")
     running_pid = _probe_running_pid()
-    _probe_pid_exists(running_pid if running_pid is not None else pid_value)
+    gateway_alive = _probe_pid_exists(running_pid if running_pid is not None else pid_value)
     _probe_state_file(home / "gateway_state.json")
-    _probe_exit_diag(home / "logs" / "gateway-exit-diag.log")
+    _probe_exit_diag(home / "logs" / "gateway-exit-diag.log", gateway_alive=gateway_alive)
 
 
 def status(deep: bool = False) -> None:

@@ -216,10 +216,30 @@ class GatewayStartupMixin:
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
-            await self._send_restart_notification()
-            if planned_restart_notification_pending:
+            from gateway.run import _hermes_home
+            from hermes_cli.gateway_windows_supervisor import (
+                format_recovery_message,
+                mark_recovery_notification_delivered,
+                recovery_marker_for_pid,
+            )
+
+            restart_target = await self._send_restart_notification()
+            skip_targets = {restart_target} if restart_target is not None else set()
+            recovery = recovery_marker_for_pid(_hermes_home, os.getpid())
+            delivered = set()
+            if recovery is not None:
+                delivered = await self._send_home_channel_startup_notifications(
+                    skip_targets=skip_targets,
+                    message=format_recovery_message(recovery),
+                )
+                if restart_target is not None or delivered:
+                    with suppress(Exception):
+                        mark_recovery_notification_delivered(_hermes_home, os.getpid())
+                if planned_restart_notification_pending:
+                    _clear_planned_restart_notification()
+            elif planned_restart_notification_pending:
                 try:
-                    await self._send_home_channel_startup_notifications(skip_targets=None)
+                    await self._send_home_channel_startup_notifications(skip_targets=skip_targets)
                 finally:
                     _clear_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)

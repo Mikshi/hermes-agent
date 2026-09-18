@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -694,6 +695,7 @@ class GatewayNotificationsMixin:
         """Notify the chat that initiated /restart that the gateway is back."""
         from gateway.delivery import resolve_delivery_transport
         from gateway.run import _hermes_home, _non_conversational_metadata
+        from hermes_cli.gateway_windows_supervisor import format_recovery_message, recovery_marker_for_pid
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
             return None
@@ -724,8 +726,14 @@ class GatewayNotificationsMixin:
                 for field in ("user_id", "scope_id"):
                     if data.get(field):
                         metadata[field] = str(data[field])
+            recovery = recovery_marker_for_pid(_hermes_home, os.getpid())
+            message = (
+                format_recovery_message(recovery)
+                if recovery is not None
+                else "♻ Gateway restarted successfully. Your session continues."
+            )
             result = await transport.send(
-                platform, str(chat_id), "♻ Gateway restarted successfully. Your session continues.",
+                platform, str(chat_id), message,
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found") and returns
@@ -800,7 +808,8 @@ class GatewayNotificationsMixin:
         return "Inference: Nous free tier (nous/welcome). Sign in for more: /login"
 
     async def _send_home_channel_startup_notifications(
-        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None
+        self, *, skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
+        message: Optional[str] = None,
     ) -> set[tuple[str, str, Optional[str]]]:
         """Notify configured home channels that the gateway is back online.
 
@@ -809,7 +818,7 @@ class GatewayNotificationsMixin:
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        message = message or "♻️ Gateway online — Hermes is back and ready."
         free_tier_line = self._free_tier_startup_line()
         if free_tier_line:
             message = f"{message}\n{free_tier_line}"

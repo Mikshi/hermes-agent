@@ -1,6 +1,7 @@
 """Tests for hermes_cli.gateway_windows."""
 
 import logging
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,31 @@ import hermes_cli.setup as setup
 
 
 _BREAKAWAY_MARKER = "_HERMES_GATEWAY_BREAKAWAY"
+
+
+def test_deep_state_probe_rejects_stale_running_claim(tmp_path, monkeypatch, capsys):
+    state = tmp_path / "gateway_state.json"
+    state.write_text(json.dumps({"gateway_state": "running", "pid": 123}), encoding="utf-8")
+    monkeypatch.setattr("gateway.status.runtime_status_pid_is_live", lambda _record: False)
+
+    gateway_windows._probe_state_file(state)
+
+    output = capsys.readouterr().out
+    assert "[5] FAIL" in output
+    assert "pid_live=False" in output
+
+
+def test_deep_lifecycle_probe_treats_unclean_exit_as_history_after_recovery(tmp_path, capsys):
+    diag = tmp_path / "gateway-exit-diag.log"
+    diag.write_text(json.dumps({
+        "tag": "gateway.previous_unclean_exit", "pid": 456, "ts": "2026-09-17T09:56:02Z",
+    }) + "\n", encoding="utf-8")
+
+    gateway_windows._probe_exit_diag(diag, gateway_alive=True)
+
+    output = capsys.readouterr().out
+    assert "[6] PASS" in output
+    assert "Historical lifecycle event" in output
 
 
 
@@ -336,12 +362,11 @@ def test_successful_scheduled_task_install_removes_startup_fallback(monkeypatch,
     assert removed == [True]
 
 
-def test_gateway_vbs_script_is_console_less_and_propagates_exit(monkeypatch):
-    """The task action stays hidden but owns Python's lifetime and result.
+def test_gateway_vbs_script_is_console_less_and_runs_bounded_supervisor(monkeypatch):
+    """The task action stays hidden and owns the Python supervisor's lifetime.
 
-    Task Scheduler applies ``RestartOnFailure`` to wscript.exe.  If the VBS
-    launcher returns immediately, a later gateway crash is invisible and the
-    configured restart policy is inert.
+    Application recovery belongs to the supervisor because live Windows evidence
+    showed RestartOnFailure was not a reliable gateway crash watchdog.
     """
     monkeypatch.setattr(
         gateway_windows,
@@ -357,10 +382,10 @@ def test_gateway_vbs_script_is_console_less_and_propagates_exit(monkeypatch):
     assert "cmd.exe" not in content.lower()
     assert 'CreateObject("WScript.Shell")' in content
     assert "pythonw.exe" in content
-    assert "hermes_cli.main" in content
-    assert "gateway run" in content
-    assert ", 0, True)" in content  # hidden window, wait for the gateway
-    assert "If exit_code <> 0 Then exit_code = 1" in content
+    assert "hermes_cli.gateway_windows_supervisor" in content
+    assert "gateway run" not in content
+    assert ", 0, True)" in content  # hidden window, wait for the supervisor
+    assert "If exit_code <> 0 Then exit_code = 1" not in content
     assert "WScript.Quit exit_code" in content
     assert ", 0, False" not in content
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
@@ -391,8 +416,6 @@ def test_gateway_vbs_script_is_console_less_and_propagates_exit(monkeypatch):
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
-
 
 
 
