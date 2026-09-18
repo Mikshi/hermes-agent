@@ -1,6 +1,7 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -53,7 +54,9 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     )
 
     result = await runner._handle_restart_command(event)
-    assert "Restarting" in result
+    assert "30" in result
+    assert "перезапуск" in result.lower()
+    runner.request_restart.assert_not_called()
 
     notify_path = tmp_path / ".restart_notify.json"
     assert notify_path.exists()
@@ -63,6 +66,10 @@ async def test_restart_command_writes_notify_file(tmp_path, monkeypatch):
     assert data["chat_type"] == "dm"
     assert data["message_id"] == "m1"
     assert "thread_id" not in data  # no thread → omitted
+
+    # Fire the scheduled callback without waiting in real time.
+    runner._restart_countdown_handle._callback()
+    runner.request_restart.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -373,6 +380,55 @@ async def test_send_restart_notification_logs_info_on_sendresult_success(
 
 
 @pytest.mark.asyncio
+async def test_restart_notification_reports_supervisor_recovery_details(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+    (tmp_path / ".gateway_recovery.json").write_text(json.dumps({
+        "schema": "hermes.gateway-recovery.r3",
+        "incident_id": "incident",
+        "kind": "planned",
+        "state": "starting",
+        "detected_at": 100.0,
+        "old_pid": 10,
+        "new_pid": os.getpid(),
+        "attempt": 0,
+        "max_attempts": 5,
+        "notification_delivered": False,
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="m-1"))
+
+    assert await runner._send_restart_notification() == ("telegram", "42", None)
+    message = adapter.send.await_args.args[1]
+    assert "Hermes восстановлен" in message
+    assert f"PID 10 → {os.getpid()}" in message
+
+
+@pytest.mark.asyncio
+async def test_second_restart_during_countdown_is_idempotent(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=make_restart_source(chat_id="42"),
+        message_id="m1",
+    )
+
+    first = await runner._handle_restart_command(event)
+    second = await runner._handle_restart_command(event)
+
+    assert "30" in first
+    assert "restart" in second.lower() or "перезапуск" in second.lower()
+    runner.request_restart.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_missing():
     runner, adapter = make_restart_runner()
     source = make_restart_source(chat_id="parent-42", chat_type="group", thread_id="topic-7")
@@ -411,5 +467,3 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     await runner._notify_active_sessions_of_shutdown()
 
     adapter.send.assert_not_awaited()
-
-
