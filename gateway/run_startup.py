@@ -243,11 +243,17 @@ class GatewayStartupMixin:
         async def _boot_sends() -> None:
             from gateway.run import _hermes_home
             from hermes_cli.gateway_windows_supervisor import (
+                RECOVERY_INCIDENT_ENV,
+                claim_recovery_marker,
                 format_recovery_message,
                 mark_recovery_notification_delivered,
                 recovery_marker_for_pid,
             )
 
+            incident_id = os.environ.get(RECOVERY_INCIDENT_ENV)
+            if incident_id:
+                with suppress(Exception):
+                    claim_recovery_marker(_hermes_home, incident_id, os.getpid())
             restart_target = await self._send_restart_notification()
             skip_targets = {restart_target} if restart_target is not None else set()
             recovery = recovery_marker_for_pid(_hermes_home, os.getpid())

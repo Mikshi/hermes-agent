@@ -35,6 +35,7 @@ RECOVERY_SCHEMA = "hermes.gateway-recovery.r3"
 RECOVERY_BACKOFF_SECONDS = (5.0, 15.0, 30.0, 60.0, 60.0)
 RECOVERY_STABLE_SECONDS = 120.0
 FAILURE_NOTIFICATION_TIMEOUT_SECONDS = 15.0
+RECOVERY_INCIDENT_ENV = "HERMES_GATEWAY_RECOVERY_INCIDENT_ID"
 
 
 def recovery_marker_path(home: Path) -> Path:
@@ -61,6 +62,29 @@ def recovery_marker_for_pid(home: Path, pid: int) -> dict[str, Any] | None:
         return marker if int(marker.get("new_pid")) == int(pid) else None
     except (TypeError, ValueError):
         return None
+
+
+def claim_recovery_marker(home: Path, incident_id: str, pid: int) -> bool:
+    """Bind a pending recovery to the exact gateway runtime PID.
+
+    On Windows the venv launcher is a waiting shim whose PID differs from the
+    Python runtime recorded in ``gateway_state.json``.  Only the child that
+    inherited this incident id may claim the marker, so notification authority
+    never binds to the shim or to an unrelated gateway life.
+    """
+    marker = read_recovery_marker(home)
+    if (
+        marker is None
+        or marker.get("incident_id") != incident_id
+        or marker.get("state") != "starting"
+    ):
+        return False
+    existing = marker.get("new_pid")
+    if existing not in (None, int(pid)):
+        return False
+    marker.update(new_pid=int(pid), claimed_at=time.time())
+    atomic_json_write(recovery_marker_path(home), marker, indent=None)
+    return True
 
 
 def format_recovery_message(marker: Mapping[str, Any], *, now: float | None = None) -> str:
@@ -237,18 +261,28 @@ class GatewayWindowsSupervisor:
     def _start_child(self, *, attempt: int | None = None) -> tuple[Any | None, float]:
         env = os.environ.copy()
         env[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
+        if self._marker is not None:
+            updates: dict[str, Any] = {"state": "starting", "new_pid": None}
+            if attempt is not None:
+                updates["attempt"] = attempt
+            marker = self._write_marker(**updates)
+            env[RECOVERY_INCIDENT_ENV] = str(marker["incident_id"])
         started_at = self.monotonic()
         try:
             process = self.popen(build_gateway_child_argv(self.python_exe, self.profile), env=env)
         except OSError:
             logger.exception("Gateway child spawn failed")
             return None, started_at
-        if self._marker is not None:
-            updates: dict[str, Any] = {"state": "starting", "new_pid": int(process.pid)}
-            if attempt is not None:
-                updates["attempt"] = attempt
-            self._write_marker(**updates)
         return process, started_at
+
+    def _runtime_pid(self, fallback: int) -> int:
+        """Resolve the gateway runtime PID preserved in its terminal status record."""
+        try:
+            payload = json.loads((self.home / "gateway_state.json").read_text(encoding="utf-8"))
+            runtime_pid = int(payload.get("pid"))
+            return runtime_pid if runtime_pid > 0 else int(fallback)
+        except (OSError, ValueError, TypeError, AttributeError):
+            return int(fallback)
 
     def _new_incident(self, *, kind: str, old_pid: int, exit_code: int, attempt: int = 0) -> None:
         self._marker = None
@@ -298,6 +332,7 @@ class GatewayWindowsSupervisor:
                 except OSError:
                     logger.exception("Gateway child wait failed")
                     exit_code = 1
+                child_pid = self._runtime_pid(child_pid)
             lived = max(0.0, self.monotonic() - started_at)
 
             if exit_code == 0:

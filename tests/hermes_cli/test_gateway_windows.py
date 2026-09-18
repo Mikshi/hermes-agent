@@ -362,6 +362,34 @@ def test_successful_scheduled_task_install_removes_startup_fallback(monkeypatch,
     assert removed == [True]
 
 
+def test_start_or_report_running_uses_registered_task_instead_of_direct_spawn(monkeypatch):
+    calls = []
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(
+        gateway_windows,
+        "_exec_schtasks",
+        lambda argv: calls.append(("task", argv)) or (0, "SUCCESS", ""),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_report_gateway_start",
+        lambda via: calls.append(("report", via)),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda: (_ for _ in ()).throw(AssertionError("direct spawn bypassed supervisor")),
+    )
+
+    gateway_windows._start_or_report_running([])
+
+    assert calls == [
+        ("task", ["/Run", "/TN", "Hermes_Gateway_alice"]),
+        ("report", "Scheduled Task 'Hermes_Gateway_alice'"),
+    ]
+
+
 def test_gateway_vbs_script_is_console_less_and_runs_bounded_supervisor(monkeypatch):
     """The task action stays hidden and owns the Python supervisor's lifetime.
 
@@ -416,6 +444,5 @@ def test_gateway_vbs_script_is_console_less_and_runs_bounded_supervisor(monkeypa
 # the gateway's marker-watcher thread to drain + exit cleanly, then escalates
 # to taskkill if drain times out.
 # ---------------------------------------------------------------------------
-
 
 
