@@ -1,8 +1,9 @@
 """Windows gateway service backend (Scheduled Task + Startup-folder fallback).
 
 Mirrors the ``launchd_*`` / ``systemd_*`` contract. ``schtasks /Create ... /RL LIMITED`` runs at the
-CURRENT USER's next logon without elevation. Manual starts and ``install --start-now`` use the direct
-hidden-console launcher instead of ``schtasks /Run`` so start/restart behavior is consistent.
+CURRENT USER's next logon without elevation. When the task is registered, manual starts and
+``install --start-now`` run it so the bounded supervisor remains the process owner; the direct
+hidden-console launcher is reserved for the Startup-folder fallback.
 """
 
 from __future__ import annotations
@@ -511,7 +512,7 @@ def _install_scheduled_task(task_name: str, script_path: Path) -> tuple[bool, st
     launcher_path = script_path.with_suffix(".vbs")   # the task launches the console-less .vbs
     xml_path = launcher_path.with_suffix(".task.xml")
     xml_path.write_text(_build_scheduled_task_xml(task_name, launcher_path, user), encoding="utf-16", newline="")
-    # Immediate manual starts use _spawn_detached(). See #45599.
+    # Registered installs start through /Run so the task-owned supervisor remains authoritative.
     base = ["/Create", "/F", "/TN", task_name, "/XML", str(xml_path)]
     variants = [[*base, "/RU", user, "/NP", "/IT"], base] if user else [base]
     last_code, last_err = 1, ""
@@ -736,11 +737,19 @@ def _report_already_running(running_pids: list[int]) -> None:
 
 
 def _start_or_report_running(running_pids: list[int] | None = None) -> None:
-    """Spawn the gateway unless one is already running for this profile."""
+    """Start the installed owner, falling back to a direct gateway only without a Task."""
     if running_pids is None:
         running_pids = _gateway_pids()
     if running_pids:
         _report_already_running(running_pids)
+    elif is_task_registered():
+        task_name = get_task_name()
+        code, out, err = _exec_schtasks(["/Run", "/TN", task_name])
+        if code != 0:
+            raise RuntimeError(
+                f"Scheduled Task start failed (code {code}): {(err or out or '').strip()}"
+            )
+        _report_gateway_start(f"Scheduled Task {task_name!r}")
     else:
         pid = _spawn_detached()
         _report_gateway_start(f"direct spawn (PID {pid})")
@@ -1413,7 +1422,7 @@ def status(deep: bool = False) -> None:
 
 
 def start() -> None:
-    """Start the gateway using the canonical detached Windows launch path."""
+    """Start the gateway through its installed owner when available."""
     _assert_windows()
     _print_start_attestation_warning()   # once: the LAST start's ✓ turned out to be false
     running_pids = _gateway_pids()
@@ -1434,10 +1443,7 @@ def start() -> None:
             print("  If a UAC prompt opened, approve it, then run: hermes gateway start")
             return
 
-    # Manual starts use the same console-less direct spawn as restart() and install --start-now;
-    # Scheduled Task / Startup entries are only login persistence.
-    pid = _spawn_detached()
-    _report_gateway_start(f"direct spawn (PID {pid})")
+    _start_or_report_running(running_pids)
 
 
 def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:

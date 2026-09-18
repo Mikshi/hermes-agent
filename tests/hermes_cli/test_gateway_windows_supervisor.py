@@ -12,6 +12,7 @@ from hermes_cli.gateway_windows_supervisor import (
     GatewayWindowsSupervisor,
     build_failure_send_argv,
     build_gateway_child_argv,
+    claim_recovery_marker,
     format_recovery_message,
     mark_recovery_notification_delivered,
     read_recovery_marker,
@@ -168,6 +169,27 @@ def test_recovery_marker_is_pid_scoped_and_formats_downtime(tmp_path):
     assert delivered["notification_delivered"] is True
 
 
+def test_gateway_runtime_claim_replaces_windows_launcher_pid(tmp_path):
+    marker = {
+        "schema": "hermes.gateway-recovery.r3",
+        "incident_id": "incident",
+        "kind": "planned",
+        "state": "starting",
+        "detected_at": 100.0,
+        "old_pid": 10,
+        "new_pid": None,
+        "attempt": 0,
+        "max_attempts": 5,
+        "notification_delivered": False,
+    }
+    (tmp_path / ".gateway_recovery.json").write_text(json.dumps(marker), encoding="utf-8")
+
+    assert claim_recovery_marker(tmp_path, "wrong-incident", 30) is False
+    assert claim_recovery_marker(tmp_path, "incident", 30) is True
+    assert recovery_marker_for_pid(tmp_path, 20) is None
+    assert recovery_marker_for_pid(tmp_path, 30)["new_pid"] == 30
+
+
 def test_supervisor_command_builders_preserve_profile_and_isolate_send():
     child = build_gateway_child_argv("python.exe", "coding-local")
     alert = build_failure_send_argv("python.exe", "coding-local", "failed")
@@ -217,8 +239,21 @@ def test_spawn_failure_uses_the_same_bounded_recovery_budget(tmp_path):
     marker = read_recovery_marker(tmp_path)
     assert marker is not None
     assert marker["old_pid"] == 0
-    assert marker["new_pid"] == 202
+    assert marker["new_pid"] is None
     assert marker["attempt"] == 1
+
+
+def test_supervisor_records_runtime_pid_instead_of_windows_shim_pid(tmp_path):
+    supervisor, _factory, _sleeps, _notices, _clock = _supervisor(
+        tmp_path, [(101, 75, 1), (202, 0, 1)]
+    )
+    (tmp_path / "gateway_state.json").write_text(json.dumps({"pid": 303}), encoding="utf-8")
+
+    assert supervisor.run() == 0
+    marker = read_recovery_marker(tmp_path)
+    assert marker is not None
+    assert marker["old_pid"] == 303
+    assert marker["new_pid"] is None
 
 
 def test_failure_notification_opt_out_never_spawns_sender(monkeypatch):
