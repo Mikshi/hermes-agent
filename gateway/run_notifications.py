@@ -836,6 +836,12 @@ class GatewayNotificationsMixin:
 
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
+                stored_message = data.get("message")
+                if message is None and isinstance(stored_message, str) and stored_message:
+                    message = stored_message
+                elif message:
+                    data["message"] = message
+
                 delivered |= {
                     tuple(target)
                     for target in data.get("delivered_targets", [])
@@ -856,7 +862,7 @@ class GatewayNotificationsMixin:
                 }
 
                 delivered |= await self._send_home_channel_startup_notifications(
-                    skip_targets=delivered,
+                    skip_targets=set(delivered),
                     message=message,
                 )
 
@@ -867,6 +873,7 @@ class GatewayNotificationsMixin:
                 data["delivered_targets"] = [
                     list(target)
                     for target in delivered
+                    if target in owed
                 ]
                 atomic_json_write(path, data, indent=None)
 
